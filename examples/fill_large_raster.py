@@ -2,16 +2,23 @@ from pathlib import Path
 import numpy as np
 import rasterio as rio
 from rasterio.fill import fillnodata
+from mpi4py import MPI
+comm = MPI.COMM_WORLD
+size = comm.Get_size()
+rank = comm.Get_rank()
+
+
 
 input_raster = '/home/sudiptra/repos/uncover-ml/relief_apsect.tif'
 src = Path(input_raster)
 dest = src.with_suffix('.filled.tif')
 
 
-if dest.exists():
-    raise FileExistsError('Output file {} exists'.format(dest.as_posix()))
-else:  # copy
-    dest.write_bytes(src.read_bytes())
+if rank == 0:
+    if dest.exists():
+        raise FileExistsError('Output file {} exists'.format(dest.as_posix()))
+    else:  # copy
+        dest.write_bytes(src.read_bytes())
 
 ids = rio.open(src, 'r')
 
@@ -64,17 +71,34 @@ from joblib import Parallel, delayed
 tiles = Parallel(n_jobs=2)(delayed(_fill_tile)(r, c) for c in range(num_cols-1)
                  for r in range(num_rows-1))
 
-i = 0
-for r in range(num_rows-1):
-    for c in range(num_cols-1):
-        ods.write_band(1, tiles[i].data, window=tiles[i].window)
-        i += 1
+# This is the multiprocess write loop
+# i = 0
+# for r in range(num_rows-1):
+#     for c in range(num_cols-1):
+#         ods.write_band(1, tiles[i].data, window=tiles[i].window)
+#         i += 1
+
+
+rc_tuples = [(r, c) for c in range(num_cols-1) for r in range(num_rows-1)]
+this_rank_jobs = np.array_split(rc_tuples, size)[rank]
+
+print(rank, this_rank_jobs)
+
+
+def _mpi_helper(list_of_tuples):
+    return [_fill_tile(* l) for l in list_of_tuples]
+
+
+this_rank_tiles = _mpi_helper(this_rank_jobs)
+
+all_tiles = comm.gather(this_rank_tiles)
+
+
+# write
+if rank == 0:
+    for s in range(size):
+        for tile in all_tiles[s]:
+            print(tile)
+            ods.write_band(1, tile.data, window=tile.window)
 
 ods.close()
-
-from mpi4py import MPI
-comm = MPI.COMM_WORLD
-size = comm.Get_size()
-rank = comm.Get_rank()
-
-
