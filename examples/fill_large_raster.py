@@ -1,44 +1,42 @@
 from pathlib import Path
 import numpy as np
+from collections import namedtuple
 import rasterio as rio
 from rasterio.fill import fillnodata
 from mpi4py import MPI
+# from joblib import Parallel, delayed
+
 comm = MPI.COMM_WORLD
 size = comm.Get_size()
 rank = comm.Get_rank()
-
-
 
 input_raster = '/home/sudiptra/repos/uncover-ml/relief_apsect.tif'
 src = Path(input_raster)
 dest = src.with_suffix('.filled.tif')
 
+ids = rio.open(src, 'r')
+
+data = None
 
 if rank == 0:
     if dest.exists():
         raise FileExistsError('Output file {} exists'.format(dest.as_posix()))
     else:  # copy
         dest.write_bytes(src.read_bytes())
+    data = ids.read(1, masked=True)
 
-ids = rio.open(src, 'r')
+    #  write nans in dest
+    ods = rio.open(dest, 'r+')
+    ods.write_band(1, np.empty_like(data, dtype=np.float32))
 
-data = ids.read(1, masked=True)
-
-ods = rio.open(dest, 'r+')
-ods.write_band(1, np.empty_like(data, dtype=np.float32))
+data = comm.bcast(data, root=0)   # read and bcast
 
 num_rows, num_cols = 4, 4
+kernel_size = 5
 
 rows = np.linspace(0, data.shape[0], num_rows, dtype=int)
 cols = np.linspace(0, data.shape[1], num_cols, dtype=int)
-
-kernel_size = 5
-
-from collections import namedtuple
-
 Tile = namedtuple('Tile', ['data', 'window'])
-
-data = ids.read(1, masked=True)
 
 
 def _fill_tile(r, c):
@@ -66,10 +64,9 @@ def _fill_tile(r, c):
                  ]
     return Tile(data=data_write, window=window_write)
 
-from joblib import Parallel, delayed
 
-tiles = Parallel(n_jobs=2)(delayed(_fill_tile)(r, c) for c in range(num_cols-1)
-                 for r in range(num_rows-1))
+# tiles = Parallel(n_jobs=2)(delayed(_fill_tile)(r, c) for c in range(num_cols-1)
+#                            for r in range(num_rows-1))
 
 # This is the multiprocess write loop
 # i = 0
@@ -82,23 +79,18 @@ tiles = Parallel(n_jobs=2)(delayed(_fill_tile)(r, c) for c in range(num_cols-1)
 rc_tuples = [(r, c) for c in range(num_cols-1) for r in range(num_rows-1)]
 this_rank_jobs = np.array_split(rc_tuples, size)[rank]
 
-print(rank, this_rank_jobs)
-
 
 def _mpi_helper(list_of_tuples):
     return [_fill_tile(* l) for l in list_of_tuples]
 
 
 this_rank_tiles = _mpi_helper(this_rank_jobs)
-
 all_tiles = comm.gather(this_rank_tiles)
-
 
 # write
 if rank == 0:
     for s in range(size):
         for tile in all_tiles[s]:
-            print(tile)
             ods.write_band(1, tile.data, window=tile.window)
 
-ods.close()
+    ods.close()
