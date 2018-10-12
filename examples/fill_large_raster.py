@@ -1,42 +1,37 @@
+import sys
 from pathlib import Path
 import numpy as np
 from collections import namedtuple
 import rasterio as rio
 from rasterio.fill import fillnodata
 from mpi4py import MPI
-# from joblib import Parallel, delayed
 
 comm = MPI.COMM_WORLD
 size = comm.Get_size()
 rank = comm.Get_rank()
 
-input_raster = '/home/sudiptra/repos/uncover-ml/relief_apsect.tif'
-src = Path(input_raster)
-dest = src.with_suffix('.filled.tif')
 
-ids = rio.open(src, 'r')
+def _get_source_data(src, dest):
 
-data = None
+    ids = rio.open(src, 'r')
+    data = None
 
-if rank == 0:
-    if dest.exists():
-        raise FileExistsError('Output file {} exists'.format(dest.as_posix()))
-    else:  # copy
-        dest.write_bytes(src.read_bytes())
-    data = ids.read(1, masked=True)
+    if rank == 0:
+        if dest.exists():
+            raise FileExistsError('Output file {} exists'.format(dest.as_posix()))
+        else:  # copy
+            dest.write_bytes(src.read_bytes())
+        data = ids.read(1, masked=True)
 
-    #  write nans in dest
-    ods = rio.open(dest, 'r+')
-    ods.write_band(1, np.empty_like(data, dtype=np.float32))
+        #  write nans in dest
+        ods = rio.open(dest, 'r+')
+        data_type = data.dtype
+        ods.write_band(1, np.empty_like(data, dtype=data_type))
+        ods.close()
 
-data = comm.bcast(data, root=0)   # read and bcast
+    data = comm.bcast(data, root=0)  # read and bcast
 
-num_rows, num_cols = 4, 4
-kernel_size = 5
-
-rows = np.linspace(0, data.shape[0], num_rows, dtype=int)
-cols = np.linspace(0, data.shape[1], num_cols, dtype=int)
-Tile = namedtuple('Tile', ['data', 'window'])
+    return data
 
 
 def _fill_tile(r, c):
@@ -50,11 +45,17 @@ def _fill_tile(r, c):
                    (cols[c] - c_buffer_l, cols[c + 1] + c_buffer_r))
     print('Write window {}'.format(window_write))
     print('Read window due to patch {}'.format(window_read))
-    tile = data[window_read[0][0]:window_read[0][1], window_read[1][0]:window_read[1][1]]
+    tile_data = data[window_read[0][0]:window_read[0][1],
+                window_read[1][0]:window_read[1][1]]
 
-    # TODO: Handle easy all maksed condition
+    orig_data = data[rows[r]: rows[r+1], cols[c]: cols[c+1]]
 
-    data_masked = fillnodata(tile, mask=None, max_search_distance=kernel_size)
+    if tile_data.count() == tile_data.size:  # all unmasked pixels, nothing to do
+        return Tile(data=orig_data, window=window_write)
+    elif tile_data.count() == 0:  # all masked pixels, can't do filling
+        return Tile(data=orig_data, window=window_write)
+
+    data_masked = fillnodata(tile_data, mask=None, max_search_distance=kernel_size)
     print(r_buffer_b, r_buffer_t, c_buffer_l, c_buffer_r)
 
     # return r_buffer_b, r_buffer_t, c_buffer_l, c_buffer_r, data_masked, window_write
@@ -65,32 +66,51 @@ def _fill_tile(r, c):
     return Tile(data=data_write, window=window_write)
 
 
-# tiles = Parallel(n_jobs=2)(delayed(_fill_tile)(r, c) for c in range(num_cols-1)
-#                            for r in range(num_rows-1))
+def _multiprocess(dest):
+    from joblib import Parallel, delayed
+    tiles = Parallel(n_jobs=2)(delayed(_fill_tile)(r, c) for c in range(num_cols-1)
+                               for r in range(num_rows-1))
 
-# This is the multiprocess write loop
-# i = 0
-# for r in range(num_rows-1):
-#     for c in range(num_cols-1):
-#         ods.write_band(1, tiles[i].data, window=tiles[i].window)
-#         i += 1
-
-
-rc_tuples = [(r, c) for c in range(num_cols-1) for r in range(num_rows-1)]
-this_rank_jobs = np.array_split(rc_tuples, size)[rank]
+    # This is the multiprocess write loop
+    i = 0
+    ods = rio.open(dest, 'r+')
+    for r in range(num_rows-1):
+        for c in range(num_cols-1):
+            ods.write_band(1, tiles[i].data, window=tiles[i].window)
+            i += 1
+    ods.close()
 
 
 def _mpi_helper(list_of_tuples):
     return [_fill_tile(* l) for l in list_of_tuples]
 
 
-this_rank_tiles = _mpi_helper(this_rank_jobs)
-all_tiles = comm.gather(this_rank_tiles)
+if __name__ == '__main__':
 
-# write
-if rank == 0:
-    for s in range(size):
-        for tile in all_tiles[s]:
-            ods.write_band(1, tile.data, window=tile.window)
+    input_raster = sys.argv[1]
+    kernel_size = int(sys.argv[2]) or 3
+    num_rows = int(sys.argv[3]) or 10
+    num_cols = int(sys.argv[4]) or 10
 
-    ods.close()
+    src = Path(input_raster)
+    dest = src.with_suffix('.filled.tif')
+    data = _get_source_data(src, dest)
+
+    rows = np.linspace(0, data.shape[0], num_rows, dtype=int)
+    cols = np.linspace(0, data.shape[1], num_cols, dtype=int)
+    Tile = namedtuple('Tile', ['data', 'window'])
+
+    rc_tuples = [(r, c) for c in range(num_cols-1) for r in range(num_rows-1)]
+    this_rank_jobs = np.array_split(rc_tuples, size)[rank]
+
+    this_rank_tiles = _mpi_helper(this_rank_jobs)
+    all_tiles = comm.gather(this_rank_tiles)
+
+    # write filled data
+    if rank == 0:
+        ods = rio.open(dest, 'r+')
+        for s in range(size):
+            for tile in all_tiles[s]:
+                ods.write_band(1, tile.data, window=tile.window)
+
+        ods.close()
