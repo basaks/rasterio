@@ -13,25 +13,25 @@ rank = comm.Get_rank()
 
 def _get_source_data(src, dest):
 
-    ids = rio.open(src, 'r')
-    data = None
+    # data = None
 
     if rank == 0:
-        if dest.exists():
-            raise FileExistsError('Output file {} exists'.format(dest.as_posix()))
-        else:  # copy
-            dest.write_bytes(src.read_bytes())
-        data = ids.read(1, masked=True)
+        dest.write_bytes(src.read_bytes())
+        ids = rio.open(src.as_posix(), 'r')
+        # data = ids.read(1, masked=True)
 
         #  write nans in dest
-        ods = rio.open(dest, 'r+')
-        data_type = data.dtype
-        ods.write_band(1, np.empty_like(data, dtype=data_type))
+        ods = rio.open(dest.as_posix(), 'r+')
+        data_type = ids.dtypes[0]
+
+        ods.write_band(1, np.empty(ids.shape, dtype=data_type))
         ods.close()
+        ids.close()
 
-    data = comm.bcast(data, root=0)  # read and bcast
+    # can't bcast more than 4GB data
+    # data = comm.bcast(data, root=0)  # read and bcast
 
-    return data
+    return None
 
 
 def _fill_tile(r, c):
@@ -45,8 +45,9 @@ def _fill_tile(r, c):
                    (cols[c] - c_buffer_l, cols[c + 1] + c_buffer_r))
     print('Write window {}'.format(window_write))
     print('Read window due to patch {}'.format(window_read))
+
     tile_data = data[window_read[0][0]:window_read[0][1],
-                window_read[1][0]:window_read[1][1]]
+                     window_read[1][0]:window_read[1][1]]
 
     orig_data = data[rows[r]: rows[r+1], cols[c]: cols[c+1]]
 
@@ -54,14 +55,12 @@ def _fill_tile(r, c):
         return Tile(data=orig_data, window=window_write)
     elif tile_data.count() == 0:  # all masked pixels, can't do filling
         return Tile(data=orig_data, window=window_write)
+    data_filled = fillnodata(tile_data, mask=None, max_search_distance=kernel_size)
 
-    data_masked = fillnodata(tile_data, mask=None, max_search_distance=kernel_size)
-    print(r_buffer_b, r_buffer_t, c_buffer_l, c_buffer_r)
-
-    # return r_buffer_b, r_buffer_t, c_buffer_l, c_buffer_r, data_masked, window_write
-    data_write = data_masked[
-                 r_buffer_b: data_masked.shape[0] - r_buffer_t,
-                 c_buffer_l: data_masked.shape[1] - c_buffer_r
+    # return r_buffer_b, r_buffer_t, c_buffer_l, c_buffer_r, data_filled, window_write
+    data_write = data_filled[
+                 r_buffer_b: data_filled.shape[0] - r_buffer_t,
+                 c_buffer_l: data_filled.shape[1] - c_buffer_r
                  ]
     return Tile(data=data_write, window=window_write)
 
@@ -73,7 +72,7 @@ def _multiprocess(dest):
 
     # This is the multiprocess write loop
     i = 0
-    ods = rio.open(dest, 'r+')
+    ods = rio.open(dest.as_posix(), 'r+')
     for r in range(num_rows-1):
         for c in range(num_cols-1):
             ods.write_band(1, tiles[i].data, window=tiles[i].window)
@@ -94,10 +93,15 @@ if __name__ == '__main__':
 
     src = Path(input_raster)
     dest = src.with_suffix('.filled.tif')
-    data = _get_source_data(src, dest)
 
-    rows = np.linspace(0, data.shape[0], num_rows, dtype=int)
-    cols = np.linspace(0, data.shape[1], num_cols, dtype=int)
+    # manage files
+    _get_source_data(src, dest)
+
+    ids = rio.open(src.as_posix(), 'r')
+    data = ids.read(1, masked=True)
+
+    rows = np.linspace(0, ids.shape[0], num_rows, dtype=int)
+    cols = np.linspace(0, ids.shape[1], num_cols, dtype=int)
     Tile = namedtuple('Tile', ['data', 'window'])
 
     rc_tuples = [(r, c) for c in range(num_cols-1) for r in range(num_rows-1)]
@@ -106,9 +110,12 @@ if __name__ == '__main__':
     this_rank_tiles = _mpi_helper(this_rank_jobs)
     all_tiles = comm.gather(this_rank_tiles)
 
+    ids.close()
+
     # write filled data
     if rank == 0:
-        ods = rio.open(dest, 'r+')
+        print('now writing data')
+        ods = rio.open(dest.as_posix(), 'r+')
         for s in range(size):
             for tile in all_tiles[s]:
                 ods.write_band(1, tile.data, window=tile.window)
