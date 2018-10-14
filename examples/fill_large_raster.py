@@ -34,7 +34,11 @@ def _get_source_data(src, dest):
     return None
 
 
-def _fill_tile(r, c):
+def _fill_tile(r, c, row_min, row_max):
+    # rows = np.linspace(0, ids.shape[0], num_rows, dtype=int)
+    rows = np.linspace(row_min, row_max, num_rows, dtype=int)
+    cols = np.linspace(0, ids.shape[1], num_cols, dtype=int)
+
     r_buffer_b = kernel_size if r != 0 else 0
     r_buffer_t = kernel_size if r != num_rows - 2 else 0
     c_buffer_l = kernel_size if c != 0 else 0
@@ -46,15 +50,17 @@ def _fill_tile(r, c):
     print('Write window {}'.format(window_write))
     print('Read window due to patch {}'.format(window_read))
 
-    tile_data = data[window_read[0][0]:window_read[0][1],
-                     window_read[1][0]:window_read[1][1]]
+    tile_data = ids.read(1, masked=True, window=window_read)
 
-    orig_data = data[rows[r]: rows[r+1], cols[c]: cols[c+1]]
+    print(tile_data.shape)
 
     if tile_data.count() == tile_data.size:  # all unmasked pixels, nothing to do
+        orig_data = ids.read(1, masked=True, window=window_write)
         return Tile(data=orig_data, window=window_write)
     elif tile_data.count() == 0:  # all masked pixels, can't do filling
+        orig_data = ids.read(1, masked=True, window=window_write)
         return Tile(data=orig_data, window=window_write)
+
     data_filled = fillnodata(tile_data, mask=None, max_search_distance=kernel_size)
 
     # return r_buffer_b, r_buffer_t, c_buffer_l, c_buffer_r, data_filled, window_write
@@ -65,9 +71,10 @@ def _fill_tile(r, c):
     return Tile(data=data_write, window=window_write)
 
 
-def _multiprocess(dest):
+def _multiprocess(dest, rows, cols):
     from joblib import Parallel, delayed
-    tiles = Parallel(n_jobs=2)(delayed(_fill_tile)(r, c) for c in range(num_cols-1)
+    tiles = Parallel(n_jobs=2)(delayed(_fill_tile)(r, c, rows, cols)
+                               for c in range(num_cols-1)
                                for r in range(num_rows-1))
 
     # This is the multiprocess write loop
@@ -84,33 +91,17 @@ def _mpi_helper(list_of_tuples):
     return [_fill_tile(* l) for l in list_of_tuples]
 
 
-if __name__ == '__main__':
+Tile = namedtuple('Tile', ['data', 'window'])
 
-    input_raster = sys.argv[1]
-    kernel_size = int(sys.argv[2]) or 3
-    num_rows = int(sys.argv[3]) or 10
-    num_cols = int(sys.argv[4]) or 10
 
-    src = Path(input_raster)
-    dest = src.with_suffix('.filled.tif')
+def _fill_partition(r_min, r_max):
 
-    # manage files
-    _get_source_data(src, dest)
-
-    ids = rio.open(src.as_posix(), 'r')
-    data = ids.read(1, masked=True)
-
-    rows = np.linspace(0, ids.shape[0], num_rows, dtype=int)
-    cols = np.linspace(0, ids.shape[1], num_cols, dtype=int)
-    Tile = namedtuple('Tile', ['data', 'window'])
-
-    rc_tuples = [(r, c) for c in range(num_cols-1) for r in range(num_rows-1)]
+    rc_tuples = [(r, c, r_min, r_max)
+                 for c in range(num_cols - 1)
+                 for r in range(num_rows - 1)]
     this_rank_jobs = np.array_split(rc_tuples, size)[rank]
-
     this_rank_tiles = _mpi_helper(this_rank_jobs)
     all_tiles = comm.gather(this_rank_tiles)
-
-    ids.close()
 
     # write filled data
     if rank == 0:
@@ -121,3 +112,31 @@ if __name__ == '__main__':
                 ods.write_band(1, tile.data, window=tile.window)
 
         ods.close()
+
+
+if __name__ == '__main__':
+
+    input_raster = sys.argv[1]
+    kernel_size = int(sys.argv[2]) or 3
+    num_rows = int(sys.argv[3]) + 1 or 10  # num rows per tile
+    num_cols = int(sys.argv[4]) + 1 or 10  # num cols per tile
+    partitions = int(sys.argv[5]) or 1
+
+    src = Path(input_raster)
+    dest = src.with_suffix('.filled.tif')
+
+    # manage files
+    _get_source_data(src, dest)
+
+    ids = rio.open(src.as_posix(), 'r')
+
+    p_rows_min_max = np.linspace(0, ids.shape[0], partitions + 1, dtype=int)
+
+    for p in range(partitions):
+        r_min = p_rows_min_max[p] if p == 0 else p_rows_min_max[p] - kernel_size
+        r_max = p_rows_min_max[p+1] if p == partitions - 1 \
+            else p_rows_min_max[p+1] + kernel_size
+        print(r_min, r_max)
+        _fill_partition(r_min, r_max)
+
+    ids.close()
